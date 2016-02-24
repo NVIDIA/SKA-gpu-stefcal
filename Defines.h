@@ -4,7 +4,7 @@
 #define SOURCES 80
 #define TIMESTEPS 30
 #define ITERATIONS 300
-#define BLOCK_WID 64
+#define BLOCK_WID 128
 #define Datatype cuComplex
 
 #endif
