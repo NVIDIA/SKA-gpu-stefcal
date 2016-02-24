@@ -208,6 +208,8 @@ int main(void)
       glast = tmp;
       float num_x, num_y;
       float denom;
+      Datatype *RM_p = RM.data;
+      float *MM_p = MM;
       for (int j = 0; j < ELEMENTS; j++) 
       {
          num_x = num_y = 0.0;
@@ -215,12 +217,14 @@ int main(void)
          #pragma omp parallel for reduction(+:num_x) reduction(+:num_y) reduction(+:denom)
          for (int i = 0; i < ELEMENTS; i++) 
          {
-            num_x += (RM[j][i].x*glast[i].x-RM[j][i].y*glast[i].y);
-            num_y += (RM[j][i].y*glast[i].x+RM[j][i].x*glast[i].y);
-            denom += MM[j*ELEMENTS+i]*(glast[i].x*glast[i].x+glast[i].y*glast[i].y);
+            num_x += (RM_p[i].x*glast[i].x-RM_p[i].y*glast[i].y);
+            num_y += (RM_p[i].y*glast[i].x+RM_p[i].x*glast[i].y);
+            denom += MM_p[i]*(glast[i].x*glast[i].x+glast[i].y*glast[i].y);
          }
          g[j].x = num_x/denom;
          g[j].y = num_y/denom;
+         RM_p += ELEMENTS;
+         MM_p += ELEMENTS;
       }
       //TODO stopping criteria
 #ifdef __DEBUG
