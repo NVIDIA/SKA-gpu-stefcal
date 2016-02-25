@@ -79,35 +79,40 @@ __global__ void stefcal_kernel(Datatype* RM, float* MM, Datatype* g, Datatype* g
    //  1. imaginary     "
    //  2. denominator
 #if BLOCK_WID > 32
-   __shared__ float snum[3][BLOCK_WID];
+   __shared__ float snum[3][BLOCK_HEIGHT][BLOCK_WID];
 #endif
 
-   RM += blockIdx.x * dim;
-   MM += blockIdx.x * dim;
+   if (blockIdx.x * BLOCK_HEIGHT + threadIdx.y >= dim) return;
+   RM += dim * (blockIdx.x * BLOCK_HEIGHT + threadIdx.y);
+   MM += dim * (blockIdx.x * BLOCK_HEIGHT + threadIdx.y);
    for(int z = threadIdx.x; z<dim; z+=blockDim.x)
    {
-      //num = num + RM[z]/**glast[z]*/;
-      num.x += RM[z].x*glast[z].x - RM[z].y*glast[z].y;
-      num.y += RM[z].x*glast[z].y + RM[z].y*glast[z].x;
-      denom = denom + MM[z]*(glast[z].x*glast[z].x+glast[z].y*glast[z].y);
+      float thisg_x = __ldg(&glast[z].x);
+      float thisg_y = __ldg(&glast[z].y);
+      num.x += RM[z].x*thisg_x - RM[z].y*thisg_y;
+      num.y += RM[z].x*thisg_y + RM[z].y*thisg_x;
+      denom = denom + MM[z]*(thisg_x*thisg_x+thisg_y*thisg_y);
    }
    //Reduce num and denom over the threadblock
 #if BLOCK_WID > 32
-   snum[0][threadIdx.x] = num.x;
-   snum[1][threadIdx.x] = num.y;
-   snum[2][threadIdx.x] = denom;
+   snum[0][threadIdx.y][threadIdx.x] = num.x;
+   snum[1][threadIdx.y][threadIdx.x] = num.y;
+   snum[2][threadIdx.y][threadIdx.x] = denom;
    
    __syncthreads();
    for(int s=BLOCK_WID/2;s>16;s/=2) {
-      if(threadIdx.x < s) snum[0][threadIdx.x] += snum[0][threadIdx.x+s]; 
-      if(threadIdx.x < s) snum[1][threadIdx.x] += snum[1][threadIdx.x+s]; 
-      if(threadIdx.x < s) snum[2][threadIdx.x] += snum[2][threadIdx.x+s]; 
+      if(threadIdx.x < s) snum[0][threadIdx.y][threadIdx.x] += 
+                             snum[0][threadIdx.y][threadIdx.x+s]; 
+      if(threadIdx.x < s) snum[1][threadIdx.y][threadIdx.x] += 
+                             snum[1][threadIdx.y][threadIdx.x+s]; 
+      if(threadIdx.x < s) snum[2][threadIdx.y][threadIdx.x] += 
+                             snum[2][threadIdx.y][threadIdx.x+s]; 
       __syncthreads();
    }
    if (threadIdx.x < 32) {
-      num.x = snum[0][threadIdx.x];
-      num.y = snum[1][threadIdx.x];
-      denom = snum[2][threadIdx.x];
+      num.x = snum[0][threadIdx.y][threadIdx.x];
+      num.y = snum[1][threadIdx.y][threadIdx.x];
+      denom = snum[2][threadIdx.y][threadIdx.x];
    }
 #endif
    if (threadIdx.x < 32)
@@ -118,11 +123,13 @@ __global__ void stefcal_kernel(Datatype* RM, float* MM, Datatype* g, Datatype* g
    }
    if (do_avg)
    {
-      if (0==threadIdx.x) g[blockIdx.x].x = (num.x/denom + glast[blockIdx.x].x)/2;
-      if (0==threadIdx.x) g[blockIdx.x].y = (num.y/denom + glast[blockIdx.x].y)/2;
+      if (0==threadIdx.x) g[blockIdx.x*BLOCK_HEIGHT+threadIdx.y].x = 
+                   (num.x/denom + glast[blockIdx.x*BLOCK_HEIGHT+threadIdx.y].x)/2;
+      if (0==threadIdx.x) g[blockIdx.x*BLOCK_HEIGHT+threadIdx.y].y = 
+                   (num.y/denom + glast[blockIdx.x*BLOCK_HEIGHT+threadIdx.y].y)/2;
    } else {
-      if (0==threadIdx.x) g[blockIdx.x].x = num.x/denom;
-      if (0==threadIdx.x) g[blockIdx.x].y = num.y/denom;
+      if (0==threadIdx.x) g[blockIdx.x*BLOCK_HEIGHT+threadIdx.y].x = num.x/denom;
+      if (0==threadIdx.x) g[blockIdx.x*BLOCK_HEIGHT+threadIdx.y].y = num.y/denom;
    }
 }
 int main(void) 
@@ -147,7 +154,7 @@ int main(void)
 
    CArray M = response*sig_in*sig_in.hermitian()*response.hermitian();
 
-   float MM[ELEMENTS*ELEMENTS];
+   float *MM  = (float*)malloc(sizeof(float)*ELEMENTS*ELEMENTS);
    CArray RM(ELEMENTS,ELEMENTS);
 
 #if 1
@@ -200,8 +207,12 @@ int main(void)
       Datatype *tmp = d_g;
       d_g = d_glast;
       d_glast = tmp;
-      stefcal_kernel<<<ELEMENTS, BLOCK_WID>>>(RM.data, d_MM, d_g, d_glast, 
+      stefcal_kernel<<<ELEMENTS/BLOCK_HEIGHT, dim3(BLOCK_WID,BLOCK_HEIGHT)>>>(RM.data, d_MM, d_g, d_glast, 
                                               d_num, d_denom, ELEMENTS, 1==iter%2);
+      cudaDeviceSynchronize();
+      cudaError_t err = cudaGetLastError();
+      if (err) fprintf(stderr, "Error in call to stefcal_kernel:\n"
+                                              "%s\n", cudaGetErrorString(err));
 #else
       Datatype *tmp = g;
       g = glast;
@@ -265,6 +276,7 @@ int main(void)
    printf("Final resid = %e\n", resid);
    printf("Compute time: %f ms\n", elapsed);
    
+   free(MM);
    cublasDestroy(g_cublasHandle);
    printf("Destroyded cublasHandle\n"); fflush(0);
 }
