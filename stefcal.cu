@@ -1,3 +1,29 @@
+/* Copyright 2016, NVIDIA Corporation 
+
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions
+ are met:
+  * Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+  * Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+  * Neither the name of NVIDIA CORPORATION nor the names of its
+    contributors may be used to endorse or promote products derived
+    from this software without specific prior written permission.
+
+ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
+ EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+ CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+ PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+ OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
+
 #include <stdio.h>
 #include <cuComplex.h>
 #include "cblas.h"
@@ -74,6 +100,12 @@ __global__ void stefcal_kernel(Datatype* RM, float* MM, Datatype* g, Datatype* g
 {
    Datatype num; num.x=0.0; num.y=0.0;
    float denom = 0.0;
+   RM+=blockIdx.y*dim*dim;
+   MM+=blockIdx.y*dim*dim;
+   g+=blockIdx.y*2*dim;
+   glast+=blockIdx.y*2*dim;
+   d_num+=blockIdx.y*dim;
+   d_denom+=blockIdx.y*dim;
    //snum has the following rows
    //  0. real       part of the numerator
    //  1. imaginary     "
@@ -132,6 +164,7 @@ __global__ void stefcal_kernel(Datatype* RM, float* MM, Datatype* g, Datatype* g
       if (0==threadIdx.x) g[blockIdx.x*BLOCK_HEIGHT+threadIdx.y].y = num.y/denom;
    }
 }
+
 int main(void) 
 {
    cublasCreate(&g_cublasHandle);
@@ -140,34 +173,42 @@ int main(void)
    cudaEventCreate(&start);
    cudaEventCreate(&stop);
    
+   float *MM  = (float*)malloc(sizeof(float)*ELEMENTS*ELEMENTS*N_POL);
+   CArray RM(ELEMENTS*N_POL,ELEMENTS);
+
    CArray sig_in(SOURCES, TIMESTEPS);
    CArray sig_out(ELEMENTS, TIMESTEPS);
-   CArray response(ELEMENTS, SOURCES);
-   sig_in.random();
-   sig_out.random();
-   for (int i=0;i<ELEMENTS;i++)
-   for (int j=0;j<TIMESTEPS;j++)
-      sig_out[i][j] = sig_out[i][j]/sqrt(1.0*TIMESTEPS);
-   response.random();
+   CArray response(ELEMENTS,SOURCES);
+   CArray Rhat_save(ELEMENTS,ELEMENTS);
+   CArray M_save(ELEMENTS,ELEMENTS);
+   for (int q=0;q<N_POL;q++) {
+      sig_in.random();
+      sig_out.random();
+      for (int i=0;i<ELEMENTS;i++)
+      for (int j=0;j<TIMESTEPS;j++)
+         sig_out[i][j] = sig_out[i][j]/sqrt(1.0*TIMESTEPS);
+      response.random();
+      CArray Rhat = sig_out*sig_out.hermitian();
 
-   CArray Rhat = sig_out*sig_out.hermitian();
-
-   CArray M = response*sig_in*sig_in.hermitian()*response.hermitian();
-
-   float *MM  = (float*)malloc(sizeof(float)*ELEMENTS*ELEMENTS);
-   CArray RM(ELEMENTS,ELEMENTS);
+      CArray M = response*sig_in*sig_in.hermitian()*response.hermitian();
 
 #if 1
-   for (int i=0;i<ELEMENTS;i++)
-   for (int j=0;j<ELEMENTS;j++)
-   {
-      //TODO MM should be real
-      MM[i*ELEMENTS+j] = (M[i][j]*conj(M[i][j])).x;  
-      RM[i][j] = conj(Rhat[j][i])*M[i][j];
-   }
+      for (int i=0;i<ELEMENTS;i++)
+      for (int j=0;j<ELEMENTS;j++)
+      {
+         //TODO MM should be real
+         MM[i*ELEMENTS+j+q*ELEMENTS*ELEMENTS] = (M[i][j]*conj(M[i][j])).x;  
+         RM[i+ELEMENTS*q][j] = conj(Rhat[j][i])*M[i][j];
+         if (N_POL-1 == q) {
+            Rhat_save[j][i] = Rhat[j][i];
+            M_save[i][j] = M[i][j];
+         }
+      }
 #endif
+      
+   }
    
-   Datatype g2[2][ELEMENTS];
+   Datatype g2[2*N_POL][ELEMENTS];
    Datatype *g, *glast;
    Datatype foo;
    foo.x=1.0;
@@ -180,7 +221,7 @@ int main(void)
    for (int j = 0; j < ELEMENTS; j++) 
    for (int i = 0; i < ELEMENTS; i++) 
    {
-      Datatype tmp = Rhat[i][j] - g[i]*conj(g[j])*M[i][j];
+      Datatype tmp = Rhat_save[i][j] - g[i]*conj(g[j])*M_save[i][j];
       //Datatype tmp = Rhat[i][j];
       foo  = foo + tmp*conj(tmp);
    }
@@ -189,12 +230,12 @@ int main(void)
    RM.memcpyH2D();
    Datatype *d_g2, *d_g, *d_glast, *d_num;
    float *d_denom, *d_MM;
-   cudaMalloc(&d_g2, sizeof(Datatype)*ELEMENTS*2);
-   cudaMalloc(&d_num, sizeof(Datatype)*ELEMENTS);
-   cudaMalloc(&d_denom, sizeof(float)*ELEMENTS);
-   cudaMalloc(&d_MM, sizeof(float)*ELEMENTS*ELEMENTS);
-   cudaMemcpy(d_g2, g2, sizeof(Datatype)*ELEMENTS*2, cudaMemcpyHostToDevice);
-   cudaMemcpy(d_MM, MM, sizeof(float)*ELEMENTS*ELEMENTS, cudaMemcpyHostToDevice);
+   cudaMalloc(&d_g2, sizeof(Datatype)*ELEMENTS*2*N_POL);
+   cudaMalloc(&d_num, sizeof(Datatype)*ELEMENTS*N_POL);
+   cudaMalloc(&d_denom, sizeof(float)*ELEMENTS*N_POL);
+   cudaMalloc(&d_MM, sizeof(float)*ELEMENTS*ELEMENTS*N_POL);
+   cudaMemcpy(d_g2, g, sizeof(Datatype)*ELEMENTS*2*N_POL, cudaMemcpyHostToDevice);
+   cudaMemcpy(d_MM, MM, sizeof(float)*ELEMENTS*ELEMENTS*N_POL, cudaMemcpyHostToDevice);
    d_g = d_g2;
    d_glast = d_g2+ELEMENTS;
    
@@ -207,8 +248,10 @@ int main(void)
       Datatype *tmp = d_g;
       d_g = d_glast;
       d_glast = tmp;
-      stefcal_kernel<<<ELEMENTS/BLOCK_HEIGHT, dim3(BLOCK_WID,BLOCK_HEIGHT)>>>(RM.data, d_MM, d_g, d_glast, 
-                                              d_num, d_denom, ELEMENTS, 1==iter%2);
+      stefcal_kernel<<<dim3(ELEMENTS/BLOCK_HEIGHT,N_POL), 
+                       dim3(BLOCK_WID,BLOCK_HEIGHT)>>>
+                                   (RM.data, d_MM, d_g, d_glast, 
+                                    d_num, d_denom, ELEMENTS, 1==iter%2);
       cudaDeviceSynchronize();
       cudaError_t err = cudaGetLastError();
       if (err) fprintf(stderr, "Error in call to stefcal_kernel:\n"
@@ -243,7 +286,7 @@ int main(void)
       for (int j = 0; j < ELEMENTS; j++) 
       for (int i = 0; i < ELEMENTS; i++) 
       {
-         Datatype tmp = Rhat[i][j] - g[i]*conj(g[j])*M[i][j];
+         Datatype tmp = Rhat_save[i][j] - g[i]*conj(g[j])*M_save[i][j];
          resid  = resid + (tmp*conj(tmp)).x;
       }
       printf("resid = %e\n", resid);
@@ -267,7 +310,7 @@ int main(void)
    for (int j = 0; j < ELEMENTS; j++) 
    for (int i = 0; i < ELEMENTS; i++) 
    {
-      Datatype tmp = Rhat[i][j] - g[i]*conj(g[j])*M[i][j];
+      Datatype tmp = Rhat_save[i][j] - g[i]*conj(g[j])*M_save[i][j];
       resid  = resid + (tmp*conj(tmp)).x;
    }
    printf("Gains:\n");
